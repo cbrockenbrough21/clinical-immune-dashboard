@@ -109,6 +109,35 @@ VALID_TIMEPOINTS = (0, 7, 14)
 # Helpers for responder analysis
 # ---------------------------------------------------------------------------
 
+def _normalize_time_filter(time_filter: "int | str | None") -> "int | None":
+    """Validate and coerce time_filter to an int (or None for pooled analysis).
+
+    Accepted values:
+        None, "all"          → returns None (no timepoint predicate)
+        int or numeric str   → coerced to int, must be in VALID_TIMEPOINTS
+
+    Raises ValueError for unrecognized or out-of-range values.
+    """
+    if time_filter is None or time_filter == "all":
+        return None
+
+    try:
+        value = int(time_filter)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid time_filter {repr(time_filter)}: expected None, 'all', "
+            f"or an integer-compatible value."
+        )
+
+    if value not in VALID_TIMEPOINTS:
+        raise ValueError(
+            f"Invalid time_filter {repr(time_filter)}: {value} is not in "
+            f"VALID_TIMEPOINTS {VALID_TIMEPOINTS}."
+        )
+
+    return value
+
+
 def _fetch_cohort_rows(
     conn: sqlite3.Connection,
     time_filter: "int | str | None",
@@ -116,7 +145,9 @@ def _fetch_cohort_rows(
     """Return percentage rows for melanoma+miraclib+PBMC, optionally by timepoint.
 
     Always includes subject_id so callers can aggregate to subject level if needed.
+    time_filter is validated and normalized via _normalize_time_filter.
     """
+    normalized = _normalize_time_filter(time_filter)
     base = """
         SELECT
             sub.subject_id,
@@ -132,11 +163,11 @@ def _fetch_cohort_rows(
           AND sub.response IN ('yes', 'no')
     """
     order = " ORDER BY cc.population, sub.response"
-    if time_filter is None or time_filter == "all":
+    if normalized is None:
         return conn.execute(base + order).fetchall()
     return conn.execute(
         base + " AND sa.time_from_treatment_start = ?" + order,
-        (int(time_filter),),
+        (normalized,),
     ).fetchall()
 
 
@@ -242,12 +273,12 @@ def _write_stratification_boxplot(
     label: str,
     path: Path,
 ) -> None:
-    time_str = "All Timepoints" if label == "all" else f"Time = {label}"
+    time_str = "All Times from treatment start" if label == "all" else f"Time from treatment start = {label}"
     fig, axes = plt.subplots(1, len(POPULATIONS), figsize=(4 * len(POPULATIONS), 5), sharey=False)
     for ax, pop in zip(axes, POPULATIONS):
         ax.boxplot(
             [groups[pop]["yes"], groups[pop]["no"]],
-            labels=["Responder\n(yes)", "Non-responder\n(no)"],
+            tick_labels=["Responder\n(yes)", "Non-responder\n(no)"],
             patch_artist=True,
             boxprops=dict(facecolor="#a8c8f0"),
             medianprops=dict(color="black", linewidth=2),

@@ -86,6 +86,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
         CREATE INDEX idx_subjects_project ON subjects(project);
         CREATE INDEX idx_subjects_treatment ON subjects(treatment);
         CREATE INDEX idx_samples_subject ON samples(subject_id);
+        CREATE INDEX idx_samples_type_time ON samples(sample_type, time_from_treatment_start);
         CREATE INDEX idx_cell_counts_population ON cell_counts(population);
         """
     )

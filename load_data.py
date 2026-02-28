@@ -119,7 +119,7 @@ def ingest_csv(connection: sqlite3.Connection, csv_path: Path) -> tuple[int, int
     # cell_counts table rows (one per population per sample)
     cell_counts: list[tuple[str, str, int]] = []
 
-    with csv_path.open("r", newline="") as csv_file:
+    with csv_path.open("r", newline="", encoding="utf-8-sig") as csv_file:
         reader = csv.DictReader(csv_file)
 
         # Minimal header validation for expected columns

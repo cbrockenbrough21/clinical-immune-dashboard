@@ -76,7 +76,7 @@ def run_frequency_metrics(conn: sqlite3.Connection) -> None:
 
     # --- All checks passed; write output ---
     out_path = OUTPUTS_DIR / "sample_population_frequencies.csv"
-    with out_path.open("w", newline="") as f:
+    with out_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["sample", "total_count", "population", "count", "percentage"])
         writer.writerows(records)

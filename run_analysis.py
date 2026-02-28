@@ -2,8 +2,9 @@ import sqlite3
 import csv
 from pathlib import Path
 
-DB_PATH = Path("immune_trial.db")
-OUTPUTS_DIR = Path("outputs")
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "immune_trial.db"
+OUTPUTS_DIR = BASE_DIR / "outputs"
 POPULATIONS = ("b_cell", "cd8_t_cell", "cd4_t_cell", "nk_cell", "monocyte")
 
 # Allowed deviation from 100.0 when summing per-sample percentages (float rounding)

@@ -50,10 +50,13 @@ clinical-immune-dashboard/
 │
 ├── outputs/                         # Generated analytical artifacts
 │   ├── sample_population_frequencies.csv
-│   ├── responder_differential_analysis.csv
-│   ├── responder_stratification_boxplot.png
 │   ├── baseline_cohort_summary.csv
-│   └── baseline_bcell_summary.txt
+│   ├── baseline_bcell_summary.txt
+│   └── responder_analysis/          # Responder stratification outputs
+│       ├── responder_differential_analysis.csv          # pooled (grading alias)
+│       ├── responder_stratification_boxplot.png         # pooled (grading alias)
+│       ├── responder_differential_analysis_time_<t>.csv # t ∈ {all, 0, 7, 14}
+│       └── responder_stratification_boxplot_time_<t>.png
 │
 ├── SCHEMA.md                        # Database schema and modeling rationale
 └── README.md
@@ -114,12 +117,34 @@ The relational schema is documented in `SCHEMA.md`. The design separates:
 
 ## Statistical Methods
 
-Responder vs non-responder comparisons use:
+Responder vs non-responder comparisons were performed separately for each immune cell population, across four analyses: pooled (all timepoints) and three time-stratified analyses (Days 0, 7, 14).
 
-- Mann–Whitney U test (non-parametric)
-- Benjamini–Hochberg correction for multiple hypothesis testing (FDR control)
+### Test
 
-These methods are appropriate for non-normally distributed immune cell frequency data.
+**Mann–Whitney U test (two-sided)** was used to compare relative frequency distributions between responders and non-responders per population. This non-parametric test was chosen because immune cell percentages are not assumed to be normally distributed.
+
+### Multiple Testing Correction
+
+**Benjamini–Hochberg (BH) FDR correction** was applied within each analysis across the five population-level tests. Correction is scoped per timepoint — it is not applied across timepoints.
+
+### Handling Repeated Measures
+
+Each patient contributes up to three longitudinal PBMC samples (Days 0, 7, 14). Analyses were structured to preserve statistical independence:
+
+| Analysis | Unit of observation | Notes |
+|---|---|---|
+| Day 0 / Day 7 / Day 14 | One sample per patient | Fully independent by construction |
+| Pooled ("all") | One value per patient | Per-patient mean across available timepoints computed before testing |
+
+For the pooled analysis, within-patient timepoints are averaged to a single value per population before the MWU test, avoiding inflation of statistical power from correlated repeated samples.
+
+### Significance Threshold
+
+Statistical significance was defined as:
+
+q < 0.05 after FDR correction.
+
+Nominal p-values are reported for transparency, but conclusions are based on FDR-adjusted q-values.
 
 ---
 

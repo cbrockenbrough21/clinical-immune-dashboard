@@ -1,10 +1,15 @@
 import sqlite3
 import csv
 from pathlib import Path
+from scipy.stats import mannwhitneyu
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "immune_trial.db"
 OUTPUTS_DIR = BASE_DIR / "outputs"
+RESPONDER_DIR = OUTPUTS_DIR / "responder_analysis"
 POPULATIONS = ("b_cell", "cd8_t_cell", "cd4_t_cell", "nk_cell", "monocyte")
 
 # Allowed deviation from 100.0 when summing per-sample percentages (float rounding)
@@ -84,8 +89,268 @@ def run_frequency_metrics(conn: sqlite3.Connection) -> None:
     print(f"[Frequency metrics] {out_path} written ({len(records)} rows, {sample_count} samples)")
 
 
+def _bh_correction(p_values: list[float]) -> list[float]:
+    """Benjamini–Hochberg FDR correction. Returns q-values in the same order as input."""
+    n = len(p_values)
+    indexed = sorted(enumerate(p_values), key=lambda x: x[1])
+    q_values = [0.0] * n
+    running_min = 1.0
+    for rev_rank, (orig_idx, p) in enumerate(reversed(indexed)):
+        rank = n - rev_rank  # 1-based rank (descending order)
+        q = p * n / rank
+        running_min = min(running_min, q)
+        q_values[orig_idx] = running_min
+    return q_values
+
+
+VALID_TIMEPOINTS = (0, 7, 14)
+
+# ---------------------------------------------------------------------------
+# Helpers for responder analysis
+# ---------------------------------------------------------------------------
+
+def _normalize_time_filter(time_filter: "int | str | None") -> "int | None":
+    """Validate and coerce time_filter to an int (or None for pooled analysis).
+
+    Accepted values:
+        None, "all"          → returns None (no timepoint predicate)
+        int or numeric str   → coerced to int, must be in VALID_TIMEPOINTS
+
+    Raises ValueError for unrecognized or out-of-range values.
+    """
+    if time_filter is None or time_filter == "all":
+        return None
+
+    try:
+        value = int(time_filter)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid time_filter {repr(time_filter)}: expected None, 'all', "
+            f"or an integer-compatible value."
+        )
+
+    if value not in VALID_TIMEPOINTS:
+        raise ValueError(
+            f"Invalid time_filter {repr(time_filter)}: {value} is not in "
+            f"VALID_TIMEPOINTS {VALID_TIMEPOINTS}."
+        )
+
+    return value
+
+
+def _fetch_cohort_rows(
+    conn: sqlite3.Connection,
+    time_filter: "int | str | None",
+) -> list[sqlite3.Row]:
+    """Return percentage rows for melanoma+miraclib+PBMC, optionally by timepoint.
+
+    Always includes subject_id so callers can aggregate to subject level if needed.
+    time_filter is validated and normalized via _normalize_time_filter.
+    """
+    normalized = _normalize_time_filter(time_filter)
+    base = """
+        SELECT
+            sub.subject_id,
+            sub.response,
+            cc.population,
+            CAST(cc.count AS REAL) * 100.0 / SUM(cc.count) OVER (PARTITION BY cc.sample_id) AS percentage
+        FROM samples sa
+        JOIN subjects sub ON sa.subject_id = sub.subject_id
+        JOIN cell_counts cc ON sa.sample_id = cc.sample_id
+        WHERE sub.condition = 'melanoma'
+          AND sub.treatment = 'miraclib'
+          AND sa.sample_type = 'PBMC'
+          AND sub.response IN ('yes', 'no')
+    """
+    order = " ORDER BY cc.population, sub.response"
+    if normalized is None:
+        return conn.execute(base + order).fetchall()
+    return conn.execute(
+        base + " AND sa.time_from_treatment_start = ?" + order,
+        (normalized,),
+    ).fetchall()
+
+
+def _group_percentages(rows: list[sqlite3.Row]) -> dict[str, dict[str, list[float]]]:
+    """Bucket sample-level percentage values by population → response group.
+
+    Used for day-specific analyses where each row is one independent sample.
+    """
+    groups: dict[str, dict[str, list[float]]] = {
+        pop: {"yes": [], "no": []} for pop in POPULATIONS
+    }
+    for row in rows:
+        groups[row["population"]][row["response"]].append(row["percentage"])
+    return groups
+
+
+def _group_percentages_subject_mean(
+    rows: list[sqlite3.Row],
+) -> dict[str, dict[str, list[float]]]:
+    """Aggregate to subject-level mean percentages by population → response group.
+
+    Used for the pooled ("all") analysis to avoid treating repeated measures from
+    the same subject as independent observations in the MWU test.
+
+    Each subject contributes exactly one value per population (the mean across
+    their available PBMC timepoints, typically 3: days 0, 7, 14).
+    """
+    from collections import defaultdict
+
+    # (subject_id, population) → list of timepoint percentages
+    subject_pcts: dict[tuple, list[float]] = defaultdict(list)
+    # subject_id → response (validated for consistency)
+    subject_response: dict[str, str] = {}
+
+    for row in rows:
+        sid = row["subject_id"]
+        pop = row["population"]
+        resp = row["response"]
+        pct = row["percentage"]
+
+        if sid in subject_response and subject_response[sid] != resp:
+            raise RuntimeError(
+                f"Subject '{sid}' appears with conflicting response values in cohort rows."
+            )
+        subject_response[sid] = resp
+        subject_pcts[(sid, pop)].append(pct)
+
+    # Validate: no subject contributes more than 3 timepoints per population
+    over_limit = {
+        k: v for k, v in subject_pcts.items() if len(v) > 3
+    }
+    if over_limit:
+        raise RuntimeError(
+            f"Subjects with >3 timepoints per population (unexpected): "
+            f"{list(over_limit.keys())[:5]}"
+        )
+
+    groups: dict[str, dict[str, list[float]]] = {
+        pop: {"yes": [], "no": []} for pop in POPULATIONS
+    }
+    for (sid, pop), pct_list in subject_pcts.items():
+        resp = subject_response[sid]
+        groups[pop][resp].append(sum(pct_list) / len(pct_list))
+
+    return groups
+
+
+def _run_mwu_with_bh(
+    groups: dict[str, dict[str, list[float]]],
+    label: str,
+) -> list[dict]:
+    """Mann–Whitney U + BH correction across all populations for one timepoint."""
+    results = []
+    for pop in POPULATIONS:
+        yes_vals = groups[pop]["yes"]
+        no_vals = groups[pop]["no"]
+        n_yes, n_no = len(yes_vals), len(no_vals)
+        if n_yes == 0 or n_no == 0:
+            raise RuntimeError(
+                f"[time={label}] Population '{pop}' has empty group: "
+                f"n_yes={n_yes}, n_no={n_no}. Cannot run Mann–Whitney U test."
+            )
+        _, p_val = mannwhitneyu(yes_vals, no_vals, alternative="two-sided")
+        results.append({"population": pop, "n_yes": n_yes, "n_no": n_no, "p_value": p_val})
+
+    q_values = _bh_correction([r["p_value"] for r in results])
+    for r, q in zip(results, q_values):
+        r["q_value"] = q
+    return results
+
+
+def _write_differential_csv(results: list[dict], path: Path) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["population", "n_yes", "n_no", "p_value", "q_value"]
+        )
+        writer.writeheader()
+        writer.writerows(results)
+
+
+def _write_stratification_boxplot(
+    groups: dict[str, dict[str, list[float]]],
+    label: str,
+    path: Path,
+) -> None:
+    time_str = "All Times from treatment start" if label == "all" else f"Time from treatment start = {label}"
+    fig, axes = plt.subplots(1, len(POPULATIONS), figsize=(4 * len(POPULATIONS), 5), sharey=False)
+    for ax, pop in zip(axes, POPULATIONS):
+        ax.boxplot(
+            [groups[pop]["yes"], groups[pop]["no"]],
+            tick_labels=["Responder\n(yes)", "Non-responder\n(no)"],
+            patch_artist=True,
+            boxprops=dict(facecolor="#a8c8f0"),
+            medianprops=dict(color="black", linewidth=2),
+        )
+        ax.set_title(pop.replace("_", " ").title(), fontsize=10)
+        ax.set_ylabel("Percentage (%)")
+        ax.tick_params(axis="x", labelsize=8)
+    fig.suptitle(
+        f"Responder vs Non-responder — Melanoma / Miraclib / PBMC ({time_str})",
+        fontsize=12,
+        y=1.02,
+    )
+    plt.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Main entry point for responder analysis (called once per timepoint)
+# ---------------------------------------------------------------------------
+
+def run_responder_analysis(
+    conn: sqlite3.Connection,
+    time_filter: "int | str | None" = None,
+) -> None:
+    """
+    Responder vs non-responder differential analysis for melanoma+miraclib+PBMC.
+
+    time_filter:
+        None / "all" — include all timepoints (pooled)
+        0, 7, 14     — restrict to that samples.time_from_treatment_start value
+    """
+    label = "all" if (time_filter is None or time_filter == "all") else str(time_filter)
+
+    rows = _fetch_cohort_rows(conn, time_filter)
+    if not rows:
+        raise RuntimeError(
+            f"No rows for melanoma+miraclib+PBMC cohort (time={label!r}). "
+            "Check data filters."
+        )
+
+    # Pooled analysis: average across timepoints per subject to preserve independence.
+    # Day-specific analyses: each sample already represents one independent subject.
+    if label == "all":
+        groups = _group_percentages_subject_mean(rows)
+    else:
+        groups = _group_percentages(rows)
+    results = _run_mwu_with_bh(groups, label)
+
+    # Time-labelled outputs
+    csv_path = RESPONDER_DIR / f"responder_differential_analysis_time_{label}.csv"
+    _write_differential_csv(results, csv_path)
+    print(f"[Responder analysis | time={label}] {csv_path} written")
+
+    plot_path = RESPONDER_DIR / f"responder_stratification_boxplot_time_{label}.png"
+    _write_stratification_boxplot(groups, label, plot_path)
+    print(f"[Responder analysis | time={label}] {plot_path} saved")
+
+    # Grading-contract aliases for the pooled ("all") run
+    if label == "all":
+        legacy_csv = RESPONDER_DIR / "responder_differential_analysis.csv"
+        _write_differential_csv(results, legacy_csv)
+        print(f"[Responder analysis | time={label}] {legacy_csv} written (grading alias)")
+
+        legacy_plot = RESPONDER_DIR / "responder_stratification_boxplot.png"
+        _write_stratification_boxplot(groups, label, legacy_plot)
+        print(f"[Responder analysis | time={label}] {legacy_plot} saved (grading alias)")
+
+
 def main() -> None:
     OUTPUTS_DIR.mkdir(exist_ok=True)
+    RESPONDER_DIR.mkdir(exist_ok=True)
 
     if not DB_PATH.exists():
         raise FileNotFoundError(
@@ -94,6 +359,8 @@ def main() -> None:
 
     with get_connection() as conn:
         run_frequency_metrics(conn)
+        for time_filter in ("all", *VALID_TIMEPOINTS):
+            run_responder_analysis(conn, time_filter)
 
 
 if __name__ == "__main__":

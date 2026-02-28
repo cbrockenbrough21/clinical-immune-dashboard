@@ -1,6 +1,10 @@
 import sqlite3
 import csv
 from pathlib import Path
+from scipy.stats import mannwhitneyu
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "immune_trial.db"
@@ -84,6 +88,100 @@ def run_frequency_metrics(conn: sqlite3.Connection) -> None:
     print(f"[Frequency metrics] {out_path} written ({len(records)} rows, {sample_count} samples)")
 
 
+def _bh_correction(p_values: list[float]) -> list[float]:
+    """Benjamini–Hochberg FDR correction. Returns q-values in the same order as input."""
+    n = len(p_values)
+    indexed = sorted(enumerate(p_values), key=lambda x: x[1])
+    q_values = [0.0] * n
+    running_min = 1.0
+    for rev_rank, (orig_idx, p) in enumerate(reversed(indexed)):
+        rank = n - rev_rank  # 1-based rank (descending order)
+        q = p * n / rank
+        running_min = min(running_min, q)
+        q_values[orig_idx] = running_min
+    return q_values
+
+
+def run_responder_analysis(conn: sqlite3.Connection) -> None:
+    """Responder vs non-responder differential analysis for melanoma+miraclib+PBMC."""
+    # Query percentages for the filtered cohort directly from the DB
+    query = """
+        SELECT
+            sub.response,
+            cc.population,
+            CAST(cc.count AS REAL) * 100.0 / SUM(cc.count) OVER (PARTITION BY cc.sample_id) AS percentage
+        FROM samples sa
+        JOIN subjects sub ON sa.subject_id = sub.subject_id
+        JOIN cell_counts cc ON sa.sample_id = cc.sample_id
+        WHERE sub.condition = 'melanoma'
+          AND sub.treatment = 'miraclib'
+          AND sa.sample_type = 'PBMC'
+          AND sub.response IN ('yes', 'no')
+        ORDER BY cc.population, sub.response
+    """
+    rows = conn.execute(query).fetchall()
+
+    if not rows:
+        raise RuntimeError("No rows returned for melanoma+miraclib+PBMC cohort. Check data filters.")
+
+    # Group percentages by (population, response)
+    from collections import defaultdict
+    groups: dict[str, dict[str, list[float]]] = {
+        pop: {"yes": [], "no": []} for pop in POPULATIONS
+    }
+    for row in rows:
+        groups[row["population"]][row["response"]].append(row["percentage"])
+
+    # Run Mann–Whitney U tests
+    results = []
+    for pop in POPULATIONS:
+        yes_vals = groups[pop]["yes"]
+        no_vals = groups[pop]["no"]
+        n_yes = len(yes_vals)
+        n_no = len(no_vals)
+        if n_yes == 0 or n_no == 0:
+            raise RuntimeError(
+                f"Population '{pop}' has empty group: n_yes={n_yes}, n_no={n_no}. "
+                "Cannot run Mann–Whitney U test."
+            )
+        stat, p_val = mannwhitneyu(yes_vals, no_vals, alternative="two-sided")
+        results.append({"population": pop, "n_yes": n_yes, "n_no": n_no, "p_value": p_val})
+
+    # Benjamini–Hochberg FDR correction
+    p_values = [r["p_value"] for r in results]
+    q_values = _bh_correction(p_values)
+    for r, q in zip(results, q_values):
+        r["q_value"] = q
+
+    # Write CSV
+    csv_path = OUTPUTS_DIR / "responder_differential_analysis.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["population", "n_yes", "n_no", "p_value", "q_value"])
+        writer.writeheader()
+        writer.writerows(results)
+    print(f"[Responder analysis] {csv_path} written ({len(results)} populations)")
+
+    # --- Boxplot ---
+    fig, axes = plt.subplots(1, len(POPULATIONS), figsize=(4 * len(POPULATIONS), 5), sharey=False)
+    for ax, pop in zip(axes, POPULATIONS):
+        yes_vals = groups[pop]["yes"]
+        no_vals = groups[pop]["no"]
+        ax.boxplot([yes_vals, no_vals], labels=["Responder\n(yes)", "Non-responder\n(no)"],
+                   patch_artist=True,
+                   boxprops=dict(facecolor="#a8c8f0"),
+                   medianprops=dict(color="black", linewidth=2))
+        ax.set_title(pop.replace("_", " ").title(), fontsize=10)
+        ax.set_ylabel("Percentage (%)")
+        ax.tick_params(axis="x", labelsize=8)
+
+    fig.suptitle("Responder vs Non-responder — Melanoma / Miraclib / PBMC", fontsize=12, y=1.02)
+    plt.tight_layout()
+    plot_path = OUTPUTS_DIR / "responder_stratification_boxplot.png"
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Responder analysis] {plot_path} saved")
+
+
 def main() -> None:
     OUTPUTS_DIR.mkdir(exist_ok=True)
 
@@ -94,6 +192,7 @@ def main() -> None:
 
     with get_connection() as conn:
         run_frequency_metrics(conn)
+        run_responder_analysis(conn)
 
 
 if __name__ == "__main__":

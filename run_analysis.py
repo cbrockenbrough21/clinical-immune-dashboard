@@ -348,6 +348,98 @@ def run_responder_analysis(
         print(f"[Responder analysis | time={label}] {legacy_plot} saved (grading alias)")
 
 
+def run_baseline_cohort_analysis(conn: sqlite3.Connection) -> None:
+    """Baseline cohort analysis for melanoma+miraclib+PBMC at time=0."""
+
+    # --- 1. Fetch baseline samples ---
+    rows = conn.execute("""
+        SELECT
+            sub.subject_id,
+            sub.project,
+            sub.sex,
+            sub.response,
+            sa.sample_id,
+            sa.time_from_treatment_start
+        FROM samples sa
+        JOIN subjects sub ON sa.subject_id = sub.subject_id
+        WHERE sub.condition = 'melanoma'
+          AND sub.treatment = 'miraclib'
+          AND sa.sample_type = 'PBMC'
+          AND sa.time_from_treatment_start = 0
+        ORDER BY sub.subject_id, sa.sample_id
+    """).fetchall()
+
+    if not rows:
+        raise RuntimeError(
+            "No baseline cohort rows found for melanoma+miraclib+PBMC at time=0."
+        )
+
+    # --- 2. Write sample listing CSV ---
+    sample_listing_path = OUTPUTS_DIR / "baseline_cohort_summary.csv"
+    fieldnames = ["subject_id", "project", "sex", "response", "sample_id", "time_from_treatment_start"]
+    with sample_listing_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row[k] for k in fieldnames})
+    print(f"[Baseline cohort] {sample_listing_path} written ({len(rows)} baseline samples)")
+
+    # --- 3. Sample counts per project ---
+    project_counts: dict[str, int] = {}
+    for row in rows:
+        project_counts[row["project"]] = project_counts.get(row["project"], 0) + 1
+    print("[Baseline cohort] Sample counts per project:")
+    for proj, cnt in sorted(project_counts.items()):
+        print(f"  {proj}: {cnt}")
+
+    # --- 4. Distinct subject counts by response ---
+    subjects_by_response: dict[str, set] = {}
+    for row in rows:
+        resp = row["response"] if row["response"] else "unknown"
+        subjects_by_response.setdefault(resp, set()).add(row["subject_id"])
+    print("[Baseline cohort] Distinct subjects by response:")
+    for resp, sids in sorted(subjects_by_response.items()):
+        print(f"  {resp}: {len(sids)}")
+
+    # --- 5. Distinct subject counts by sex ---
+    subjects_by_sex: dict[str, set] = {}
+    for row in rows:
+        sex = row["sex"] if row["sex"] else "unknown"
+        subjects_by_sex.setdefault(sex, set()).add(row["subject_id"])
+    print("[Baseline cohort] Distinct subjects by sex:")
+    for sex, sids in sorted(subjects_by_sex.items()):
+        print(f"  {sex}: {len(sids)}")
+
+    # --- 6. Average b_cell COUNT for melanoma males who are responders at time=0 ---
+    result = conn.execute("""
+        SELECT AVG(cc.count) AS avg_b_cell
+        FROM samples sa
+        JOIN subjects sub ON sa.subject_id = sub.subject_id
+        JOIN cell_counts cc ON sa.sample_id = cc.sample_id
+        WHERE sub.condition = 'melanoma'
+          AND sub.treatment = 'miraclib'
+          AND sa.sample_type = 'PBMC'
+          AND sa.time_from_treatment_start = 0
+          AND sub.sex = 'M'
+          AND sub.response = 'yes'
+          AND cc.population = 'b_cell'
+    """).fetchone()
+
+    avg_b_cell = result["avg_b_cell"]
+    if avg_b_cell is None:
+        raise RuntimeError(
+            "No b_cell count data found for melanoma male responders at time=0."
+        )
+
+    formatted = f"{avg_b_cell:.2f}"
+    bcell_path = OUTPUTS_DIR / "baseline_bcell_summary.txt"
+    bcell_path.write_text(
+        f"Average b_cell count for melanoma male responders at baseline (time=0): {formatted}\n",
+        encoding="utf-8",
+    )
+    print(f"[Baseline cohort] {bcell_path} written (avg_b_cell={formatted})")
+
+
 def main() -> None:
     OUTPUTS_DIR.mkdir(exist_ok=True)
     RESPONDER_DIR.mkdir(exist_ok=True)
@@ -361,6 +453,7 @@ def main() -> None:
         run_frequency_metrics(conn)
         for time_filter in ("all", *VALID_TIMEPOINTS):
             run_responder_analysis(conn, time_filter)
+        run_baseline_cohort_analysis(conn)
 
 
 if __name__ == "__main__":

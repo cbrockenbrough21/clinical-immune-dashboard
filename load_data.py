@@ -10,6 +10,9 @@ CSV_CANDIDATES = ("cell-count.csv", "data/cell-count.csv")
 # Canonical populations for this dataset (allowlist)
 POPULATIONS = ("b_cell", "cd8_t_cell", "cd4_t_cell", "nk_cell", "monocyte")
 
+# Subject-level fields that must be consistent across all rows for the same subject
+SUBJECT_FIELDS = ("project", "condition", "treatment", "age", "sex")
+
 
 def normalize_optional_str(value: Optional[str]) -> Optional[str]:
     """
@@ -100,6 +103,12 @@ def ingest_csv(connection: sqlite3.Connection, csv_path: Path) -> tuple[int, int
     # Track a single canonical non-null response per subject (if present)
     subject_to_response: dict[str, Optional[str]] = {}
 
+    # Track subject-level metadata for consistency validation
+    subject_metadata: dict[str, dict[str, str]] = {}
+
+    # Track sample_ids to detect duplicates in the CSV
+    seen_sample_ids: set[str] = set()
+
     # subjects table rows (dedup by subject_id)
     subjects: dict[str, tuple[str, str, str, Optional[int], Optional[str], str, Optional[str]]] = {}
 
@@ -126,6 +135,11 @@ def ingest_csv(connection: sqlite3.Connection, csv_path: Path) -> tuple[int, int
             subject_id = row["subject"].strip()
             sample_id = row["sample"].strip()
 
+            # Validate no duplicate sample_ids in the CSV
+            if sample_id in seen_sample_ids:
+                raise ValueError(f"Duplicate sample_id in CSV: {sample_id}")
+            seen_sample_ids.add(sample_id)
+
             # Normalize optional fields
             response = normalize_optional_str(row.get("response"))
             sex = normalize_optional_str(row.get("sex"))  # if your CSV uses 'gender', map it here
@@ -150,6 +164,25 @@ def ingest_csv(connection: sqlite3.Connection, csv_path: Path) -> tuple[int, int
                         raise ValueError(
                             "Inconsistent response for subject "
                             f"{subject_id}: {existing_response} vs {response}"
+                        )
+
+            # Validate subject-level metadata consistency across rows
+            current_meta = {
+                "project": row["project"].strip(),
+                "condition": row["condition"].strip(),
+                "treatment": row["treatment"].strip(),
+                "age": row.get("age", "").strip(),
+                "sex": row.get("sex", "").strip(),
+            }
+            if subject_id not in subject_metadata:
+                subject_metadata[subject_id] = current_meta
+            else:
+                stored = subject_metadata[subject_id]
+                for field in SUBJECT_FIELDS:
+                    if stored[field] != current_meta[field]:
+                        raise ValueError(
+                            f"Inconsistent {field} for subject {subject_id}: "
+                            f"{stored[field]!r} vs {current_meta[field]!r}"
                         )
 
             # Insert subject once

@@ -302,10 +302,13 @@ def run() -> None:
     csv_path = resolve_csv_path(repo_root)
 
     connection = rebuild_database(db_path)
-    with connection:
-        create_schema(connection)
-        subject_count, sample_count, cell_count = ingest_csv(connection, csv_path)
-        validate_integrity(connection)
+    try:
+        with connection:
+            create_schema(connection)
+            subject_count, sample_count, cell_count = ingest_csv(connection, csv_path)
+            validate_integrity(connection)
+    finally:
+        connection.close()
 
     print("load_data.py completed successfully")
     print(f"Database: {db_path}")
